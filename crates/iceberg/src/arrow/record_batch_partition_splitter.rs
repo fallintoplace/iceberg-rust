@@ -18,9 +18,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, BooleanArray, RecordBatch, StructArray};
+use arrow_array::{ArrayRef, BooleanArray, RecordBatch, StructArray, UInt64Array};
 use arrow_buffer::BooleanBufferBuilder;
 use arrow_select::filter::filter_record_batch;
+use arrow_select::take::take_record_batch;
 
 use super::arrow_struct_to_literal;
 use super::partition_value_calculator::PartitionValueCalculator;
@@ -179,26 +180,32 @@ impl RecordBatchPartitionSplitter {
 
         // Partition the batch with same partition partition_values
         let mut partition_batches = Vec::with_capacity(group_ids.len());
+        let single_partition = group_ids.len() == 1;
         for (row, row_ids) in group_ids.into_iter() {
-            // generate the bool filter array from column_ids
-            let filter_array: BooleanArray = {
+            let partition_batch = if single_partition {
+                batch.clone()
+            } else if row_ids.len() <= batch.num_rows() / 64 {
+                // A 64-bit index buffer is no larger than one full selection bitmap.
+                let indices =
+                    UInt64Array::from_iter_values(row_ids.into_iter().map(|row_id| row_id as u64));
+                take_record_batch(batch, &indices)?
+            } else {
                 let mut builder = BooleanBufferBuilder::new(batch.num_rows());
                 builder.append_n(batch.num_rows(), false);
                 for row_id in row_ids {
                     builder.set_bit(row_id, true);
                 }
-                BooleanArray::new(builder.finish(), None)
+                let filter_array = BooleanArray::new(builder.finish(), None);
+                filter_record_batch(batch, &filter_array)?
             };
 
-            // Create PartitionKey from the partition struct
             let partition_key = PartitionKey::new(
                 self.partition_spec.as_ref().clone(),
                 self.schema.clone(),
                 row,
             );
 
-            // filter the RecordBatch
-            partition_batches.push((partition_key, filter_record_batch(batch, &filter_array)?));
+            partition_batches.push((partition_key, partition_batch));
         }
 
         Ok(partition_batches)
@@ -547,4 +554,95 @@ mod tests {
             (Struct::from_iter([Some(Literal::double(0.0))]), vec![2]),
         ]);
     }
+    #[test]
+    fn test_partition_split_reuses_single_partition_and_takes_sparse_partitions() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(crate::spec::PrimitiveType::Int))
+                        .into(),
+                    NestedField::optional(
+                        2,
+                        "name",
+                        Type::Primitive(crate::spec::PrimitiveType::String),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let partition_spec = Arc::new(
+            PartitionSpecBuilder::new(schema.clone())
+                .with_spec_id(1)
+                .add_unbound_field(
+                    UnboundPartitionField::builder()
+                        .source_ids(vec![1])
+                        .name("id_partition".to_string())
+                        .transform(Transform::Identity)
+                        .build()
+                        .unwrap(),
+                )
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        let splitter = RecordBatchPartitionSplitter::try_new_with_computed_values(
+            schema.clone(),
+            partition_spec,
+        )
+        .unwrap();
+        let arrow_schema = Arc::new(schema_to_arrow_schema(&schema).unwrap());
+        let num_rows = 256_usize;
+
+        for partition_count in [1, 128] {
+            let ids: Vec<i32> = (0..num_rows)
+                .map(|i| {
+                    if partition_count == 128 && i < 128 {
+                        0
+                    } else {
+                        (i % partition_count) as i32
+                    }
+                })
+                .collect();
+            let names = StringArray::from_iter(
+                (0..num_rows).map(|i| if i % 7 == 0 { None } else { Some("value") }),
+            );
+            let batch = RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![Arc::new(Int32Array::from(ids.clone())), Arc::new(names)],
+            )
+            .unwrap();
+
+            let partitions = splitter.split(&batch).unwrap();
+            assert_eq!(partitions.len(), partition_count);
+
+            for (key, partition_batch) in &partitions {
+                let partition_id = match key.data().fields()[0]
+                    .as_ref()
+                    .unwrap()
+                    .as_primitive_literal()
+                    .unwrap()
+                {
+                    PrimitiveLiteral::Int(id) => *id,
+                    _ => panic!("Expected integer partition"),
+                };
+                let mask = BooleanArray::from(
+                    (0..num_rows)
+                        .map(|i| ids[i] == partition_id)
+                        .collect::<Vec<_>>(),
+                );
+                let expected = filter_record_batch(&batch, &mask).unwrap();
+                assert_eq!(partition_batch, &expected);
+
+                if partition_count == 1 {
+                    for (source, partition) in
+                        batch.columns().iter().zip(partition_batch.columns())
+                    {
+                        assert!(Arc::ptr_eq(source, partition));
+                    }
+                }
+            }
+        }
+    }
+
 }
