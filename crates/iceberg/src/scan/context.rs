@@ -22,7 +22,7 @@ use futures::channel::mpsc::Sender;
 use futures::{SinkExt, TryFutureExt};
 
 use crate::delete_file_index::DeleteFileIndex;
-use crate::expr::{Bind, BoundPredicate, Predicate};
+use crate::expr::BoundPredicate;
 use crate::io::object_cache::ObjectCache;
 use crate::scan::{
     BoundPredicates, ExpressionEvaluatorCache, FileScanTask, ManifestEvaluatorCache,
@@ -203,7 +203,6 @@ pub(crate) struct PlanContext {
     /// the schema the snapshot was written with.
     pub snapshot_schema: SchemaRef,
     pub case_sensitive: bool,
-    pub predicate: Option<Arc<Predicate>>,
     pub snapshot_bound_predicate: Option<Arc<BoundPredicate>>,
     pub object_cache: Arc<ObjectCache>,
     pub field_ids: Arc<Vec<i32>>,
@@ -239,14 +238,12 @@ impl PlanContext {
             &self.table_metadata,
             &self.snapshot_schema,
             self.case_sensitive,
-            self.predicate
-                .as_ref()
+            self.snapshot_bound_predicate
+                .as_deref()
                 .ok_or(Error::new(
                     ErrorKind::Unexpected,
                     "Expected a predicate but none present",
-                ))?
-                .as_ref()
-                .bind(self.snapshot_schema.clone(), self.case_sensitive)?,
+                ))?,
         )?;
 
         Ok(partition_filter)
@@ -280,7 +277,7 @@ impl PlanContext {
                 tx_data.clone()
             };
 
-            let partition_bound_predicate = if self.predicate.is_some() {
+            let partition_bound_predicate = if self.snapshot_bound_predicate.is_some() {
                 let partition_bound_predicate = self.get_partition_filter(manifest_file)?;
 
                 // evaluate the ManifestFile against the partition filter. Skip
@@ -326,8 +323,8 @@ impl PlanContext {
                 (partition_filter, &self.snapshot_bound_predicate)
             {
                 Some(Arc::new(BoundPredicates {
-                    partition_bound_predicate: partition_bound_predicate.as_ref().clone(),
-                    snapshot_bound_predicate: snapshot_bound_predicate.as_ref().clone(),
+                    partition_bound_predicate: partition_bound_predicate.clone(),
+                    snapshot_bound_predicate: snapshot_bound_predicate.clone(),
                 }))
             } else {
                 None

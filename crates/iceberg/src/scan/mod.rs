@@ -348,7 +348,6 @@ impl<'a> TableScanBuilder<'a> {
             table_metadata: self.table.metadata_ref(),
             snapshot_schema: schema,
             case_sensitive: self.case_sensitive,
-            predicate: self.filter.map(Arc::new),
             snapshot_bound_predicate,
             object_cache: self.table.object_cache(),
             field_ids: Arc::new(field_ids),
@@ -683,8 +682,8 @@ impl TableScan {
 }
 
 pub(crate) struct BoundPredicates {
-    partition_bound_predicate: BoundPredicate,
-    snapshot_bound_predicate: BoundPredicate,
+    partition_bound_predicate: Arc<BoundPredicate>,
+    snapshot_bound_predicate: Arc<BoundPredicate>,
 }
 
 #[cfg(test)]
