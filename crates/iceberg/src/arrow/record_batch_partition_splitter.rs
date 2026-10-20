@@ -554,6 +554,7 @@ mod tests {
             (Struct::from_iter([Some(Literal::double(0.0))]), vec![2]),
         ]);
     }
+
     #[test]
     fn test_partition_split_reuses_single_partition_and_takes_sparse_partitions() {
         let schema = Arc::new(
@@ -644,5 +645,4 @@ mod tests {
             }
         }
     }
-
 }
